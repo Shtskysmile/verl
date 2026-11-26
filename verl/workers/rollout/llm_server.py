@@ -333,6 +333,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     previous = np.zeros(len(final_output.token_ids) - len(output.token_ids), dtype=np.bool_)
                 final_output.extra_fields["response_support_complete"] = np.concatenate([previous, current])
             final_output.stop_reason = output.stop_reason
+            # Preserve the backend's ending metadata when rebuilding async outputs.
+            final_output.extra_fields["finish_reason"] = output.extra_fields.get("finish_reason")
 
             # carry the initial prefill's prefix-cache hit count forward
             if num_cached_tokens is None:

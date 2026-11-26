@@ -91,6 +91,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
         response_ids = merge_result.token_ids[-len(response_mask) :] if response_mask else []
         prompt_ids = merge_result.token_ids[: len(merge_result.token_ids) - len(response_mask)]
 
+        # AgentLoopOutput has no stop_reason field; retain it for generation dumps.
+        output.extra_fields["stop_reason"] = output.stop_reason
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],

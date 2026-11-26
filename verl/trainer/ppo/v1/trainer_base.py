@@ -1410,7 +1410,7 @@ class PPOTrainer(ABC):
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
@@ -1442,6 +1442,14 @@ class PPOTrainer(ABC):
             scores = [scores[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            extra_fields = data.get("extra_fields")
+            if extra_fields is not None:
+                extra_fields_list = extra_fields.tolist()
+                for name in ("finish_reason", "stop_reason"):
+                    reward_extra_infos_dict[name] = [
+                        extra_fields_list[i].get(name) if isinstance(extra_fields_list[i], dict) else None
+                        for i in sorted_indices
+                    ]
 
             self._dump_generations(
                 inputs=inputs,
