@@ -1,9 +1,8 @@
 # Retain the original Omega reproduction data and training/rollout hyperparameters.
 # Qwen2.5-7B-Instruct, one instance with disjoint trainer 4-NPU and rollout 4-NPU pools.
 # Train for 10 steps, validate at steps 5 and 10; partial_rollout remains false.
-# Launch from the repository root with verl.trainer.main_ppo and --config-path "$PWD/config".
-# Use an existing Ascend training environment; no cross-datacenter launcher is required.
-# Start the driver with /root/.local/conda/envs/verl/bin/python; Ray workers use it below.
+# Launch with scripts/run_partial_rollout_baseline.sh to activate the reference CANN/ATB stack.
+# Driver and Ray workers both use /root/.local/conda/envs/verl/bin/python.
 defaults:
   - ppo_trainer
   - _self_
