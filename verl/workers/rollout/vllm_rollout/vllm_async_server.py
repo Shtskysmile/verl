@@ -1174,12 +1174,6 @@ class vLLMHttpServer:
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
-    async def finish_all_requests(self, reject_request: bool = False) -> dict[str, Any]:
-        """Finish all admitted requests on the current weights, then pause the engine."""
-        if self.node_rank != 0:
-            return {"finished_count": 0, "request_ids": []}
-        return await self._pause_requests(reject_request=reject_request, wait_for_inflight_requests=True)
-
     async def abort_all_requests(
         self,
         reset_prefix_cache: bool = True,
@@ -1237,15 +1231,6 @@ class vLLMHttpServer:
             await self.engine.abort([*request_ids, *parent_ids], internal=True)
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
-        return await self._pause_requests(reset_prefix_cache=reset_prefix_cache, reject_request=reject_request)
-
-    async def _pause_requests(
-        self,
-        reset_prefix_cache: bool = True,
-        reject_request: bool = False,
-        wait_for_inflight_requests: bool = False,
-    ) -> dict[str, Any]:
-        """Close admission, abort or finish existing requests, and pause scheduling."""
         try:
             # Close the gate first, then let admissions already past it land, so the pause
             # below actually covers them. Closing the gate and declaring how late arrivals
@@ -1255,7 +1240,7 @@ class vLLMHttpServer:
             self._resume_event.clear()
             deadline = time.monotonic() + _GATE_BARRIER_TIMEOUT_S
             while self._admitting > 0:
-                if not wait_for_inflight_requests and time.monotonic() > deadline:
+                if time.monotonic() > deadline:
                     if self.config.external_kv_cache_invalidation == "salt":
                         # A straggler would run on the new weights under its old salt and write
                         # into the kept KV store, so do not proceed with the weight update.
@@ -1272,15 +1257,9 @@ class vLLMHttpServer:
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
 
-            if wait_for_inflight_requests:
-                # Keep scheduling queued and preempted requests on the old weights.
-                # Native wait pauses that queue, so drain it before pausing the engine.
-                while self.engine.output_processor.request_states:
-                    await asyncio.sleep(0.01)
-
-            # pause_generation will:
+            # pause_generation in abort mode will:
             # 1. Set engine to paused state (new requests are accepted but not scheduled)
-            # 2. Abort in-flight requests, or wait for the completed generation to drain
+            # 2. Abort all in-flight requests
             # 3. Wait for requests to drain
             # 4. Clear prefix and mm caches if clear_cache=True.
             #    EngineCore._reset_caches defaults reset_connector=True
@@ -1293,27 +1272,22 @@ class vLLMHttpServer:
             reset_connector = self.config.external_kv_cache_invalidation == "reset"
             clear_cache = reset_prefix_cache and reset_connector
             if _VLLM_VERSION >= version.parse("0.32.0"):
-                await self.engine.pause_generation(
-                    mode="wait" if wait_for_inflight_requests else "abort", clear_cache=clear_cache
-                )
+                await self.engine.pause_generation(mode="abort", clear_cache=clear_cache)
             else:
                 await self.engine.pause_generation(
-                    wait_for_inflight_requests=wait_for_inflight_requests,
+                    wait_for_inflight_requests=False,
                     clear_cache=clear_cache,
                 )
             if reset_prefix_cache and not reset_connector:
                 await self.clear_kv_cache()
 
-            if wait_for_inflight_requests:
-                logger.info(f"Finished {len(request_ids)} requests on the old weights: {request_ids}")
-                return {"finished_count": len(request_ids), "request_ids": request_ids}
             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
         except Exception:
             # Weight updates must not proceed unless every in-flight request was
-            # actually aborted or finished and the old-weight caches were cleared.
-            logger.exception("Error pausing requests")
+            # actually aborted and the old-weight caches were cleared.
+            logger.exception("Error aborting requests")
             raise
 
     async def resume_engine_generation(self):

@@ -1,6 +1,6 @@
 # 异步 partial_rollout 修改记录
 
-对比基线：`5ac083c5`（`[ascend, rollout] chore: restore dedicated baseline launcher`）与当前工作区。当前修改未提交。
+本文记录等待完成模式，相对基线为 `5ac083c5`（`[ascend, rollout] chore: restore dedicated baseline launcher`），已保存到 commit `31a7b03a`。后续 abort 后丢弃方案见 [partial_rollout_drop_record.md](partial_rollout_drop_record.md)；下面的 diff 和实验分析对应等待完成版本。
 
 实现路径为 V1 异步 trainer、CheckpointEngineManager 和 vLLM rollout；复现配置使用 `separate_async + vllm + nccl`。finish RPC 的引擎实现位于 vLLM，SGLang 和 TRT-LLM 未扩展相同接口。
 

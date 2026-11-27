@@ -40,6 +40,10 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+class RolloutAbortedError(RuntimeError):
+    """An unfinished rollout must be discarded instead of scored or trained."""
+
+
 class LLMServerClient:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -274,6 +278,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 original_max_tokens = response_length
                 sampling_params[limit_key] = response_length
 
+        partial_rollout = getattr(getattr(self.config, "async_training", None), "partial_rollout", True)
         final_output = TokenOutput(
             token_ids=[],
             log_probs=[],
@@ -299,6 +304,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 mm_processor_kwargs=mm_processor_kwargs,
                 **kwargs,
             )
+
+            # Check before merging tokens or converting an exhausted budget to "length":
+            # even a nonempty abort is not a completed response when continuation is disabled.
+            if output.stop_reason in ("aborted", "abort") and not partial_rollout:
+                raise RolloutAbortedError(f"Rollout request {request_id} was aborted with partial_rollout disabled")
 
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
@@ -356,9 +366,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     break
 
             # 4. check stop reason
-            # Weight updates abort requests only when partial rollout is enabled;
-            # otherwise the server finishes them on the current weights first.
-            # Retry aborted requests instead of returning an unfinished response.
+            # Partial rollout retains the prefix and retries after weight synchronization.
+            # Disabled continuation raises above so the caller can discard the prompt group.
             if output.stop_reason not in ("aborted", "abort"):
                 break
 

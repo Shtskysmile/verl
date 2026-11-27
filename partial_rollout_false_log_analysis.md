@@ -1,5 +1,7 @@
 # partial_rollout=False 日志分析
 
+本文的 False r01/r02 结果对应等待完成模式，代码保存于 `31a7b03a`。随后新增的 abort 后丢弃方案尚未用于这些实验，见 [partial_rollout_drop_record.md](partial_rollout_drop_record.md)。
+
 分析对象为 `outputs/partial_rollout_repro/` 中的三次实验：原 bug 的 `omega_qwen25_7b_single_instance_4t4r_r02`、修复后 False 的 `omega_qwen25_7b_single_instance_4t4r_partial_rollout_false_r01`、修复后 True 的 `omega_qwen25_7b_single_instance_4t4r_partial_rollout_true_r01`。读取了指标 JSONL、每步 rollout、两次 validation、实际 Hydra 配置和相关源码；未改动训练代码，未重新训练。
 
 **结论：False 验证准确率下降的直接原因已经定位到答案结尾的格式退化。现有证据尚不足以把这种退化的上游原因唯一归结为 finish 实现或 off-policy。** 当前只记录了第 5、10 步验证，不能据此判断准确率每一步都在下降。

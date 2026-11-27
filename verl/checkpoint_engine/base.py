@@ -432,14 +432,14 @@ class CheckpointEngineManager:
 
     1. Coupled strong synchronization (``support_publish_weights=False``), such as NCCL/NIXL:
        the trainer sender and rollout receiver must participate in the same transfer. The manager waits for the
-       previous update to commit, pauses in-flight generation, releases the rollout KV cache, builds the communication
+       previous update to commit, aborts in-flight generation, releases the rollout KV cache, builds the communication
        topology, and starts trainer send plus rollout receive. ``update_weights`` returns only after rollout installs
        the version, both sides finalize the transfer, and rollout generation resumes.
 
     2. Decoupled publish/commit (``support_publish_weights=True``), such as a trainer D2H snapshot followed by an
        asynchronous rollout RDMA read: after synchronously building the control-plane topology, the manager starts
        trainer publish and schedules rollout commit on its background event loop. ``update_weights`` returns once the
-       immutable trainer snapshot is published; in parallel, the background task pauses generation, releases the KV
+       immutable trainer snapshot is published; in parallel, the background task aborts generation, releases the KV
        cache, fetches and installs that version, finalizes the transfer, and resumes rollout.
 
     The manager allows at most one uncommitted version. Every new update first waits for the previous rollout commit,
@@ -449,7 +449,6 @@ class CheckpointEngineManager:
         config: The checkpoint engine config.
         actor_wg: The actor worker group (the training side that produces weights).
         replicas: The list of rollout replicas.
-        partial_rollout: Abort unfinished generation when True, otherwise finish it before updating weights.
     """
 
     def __init__(
@@ -457,7 +456,6 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         actor_wg: RayWorkerGroup,
         replicas: list[RolloutReplica],
-        partial_rollout: bool = True,
     ) -> None:
         self.config = config
         self.backend = config.backend
@@ -465,7 +463,6 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
-        self.partial_rollout = partial_rollout
 
         self._update_ticket = None
         self._background_loop = asyncio.new_event_loop()
@@ -554,20 +551,17 @@ class CheckpointEngineManager:
 
     @auto_await
     async def abort_replicas(self, reject_request: bool = False):
-        """Pause replicas by aborting or finishing in-flight generation.
+        """Abort all in-flight requests on every replica.
 
         Args:
             reject_request: Fail requests arriving behind the closed gate instead of
                 parking them, for replicas that will not resume generation soon.
         """
-        if self.partial_rollout:
-            await asyncio.gather(*[r.abort_all_requests(reject_request=reject_request) for r in self.replicas])
-        else:
-            await asyncio.gather(*[r.finish_all_requests(reject_request=reject_request) for r in self.replicas])
+        await asyncio.gather(*[r.abort_all_requests(reject_request=reject_request) for r in self.replicas])
 
     @auto_await
     async def resume_generation_replicas(self):
-        """Resume generation on all replicas after the weight update."""
+        """Resume generation on all replicas after abort_all_requests."""
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
     @auto_await

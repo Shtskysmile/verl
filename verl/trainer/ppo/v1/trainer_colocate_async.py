@@ -20,7 +20,7 @@ from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 class PPOTrainerColocateAsync(PPOTrainer):
     """Asynchronous PPO trainer
     1. Trainer and rollout are colocated.
-    2. Generation resumes after weight synchronization.
+    2. Partial rollout is enabled.
     """
 
     def get_llm_client(self):
@@ -42,7 +42,7 @@ class PPOTrainerColocateAsync(PPOTrainer):
             self.checkpoint_manager.resume_generation_replicas()
 
     def on_sample_end(self):
-        # pause generation by aborting or finishing unfinished requests
+        # abort all unfinished requests and pause generation
         self.checkpoint_manager.abort_replicas()
         # sleep all replicas to discard weights and kv cache
         self.checkpoint_manager.sleep_replicas()

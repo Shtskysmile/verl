@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +22,10 @@ from omegaconf import OmegaConf
 import verl.trainer.ppo.v1.agent_loop_tq as agent_loop_tq_module
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
 from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ, _settle_session_tasks, apply_greedy_sampling_params
+from verl.trainer.ppo.v1.replay_buffer import ReplayBufferAsync
+from verl.workers.rollout import llm_server
+from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, RolloutAbortedError
+from verl.workers.rollout.replica import TokenOutput
 
 
 def test_settle_session_tasks_waits_for_siblings_after_failure():
@@ -143,3 +148,124 @@ async def test_agent_loop_tq_postprocess_skips_rollout_topk_on_validate(monkeypa
 
     assert "rollout_topk_ids" not in fields.keys()
     assert "rollout_topk_log_probs" not in fields.keys()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["abort", "aborted"])
+@pytest.mark.parametrize("validate", [True, False])
+async def test_aborted_agent_output_is_rejected_before_scoring(monkeypatch, stop_reason, validate):
+    worker = _DummyWorker(topk_log_probs=0)
+
+    async def must_not_score(*args, **kwargs):
+        pytest.fail("An aborted output must not reach reward scoring")
+
+    worker._compute_score = must_not_score
+    with pytest.raises(RolloutAbortedError):
+        await _postprocess(monkeypatch, worker, [_output({}), _output({"stop_reason": stop_reason})], validate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token_ids", [[], [11]])
+async def test_abort_discards_whole_group_after_siblings_settle_and_refills(monkeypatch, token_ids):
+    # Exercise the real client, TQ postprocessing, prompt lifecycle and replay sampling;
+    # only the backend response and TransferQueue transport are replaced.
+    metadata = {"train": {"u0": {"is_prompt": True, "status": "pending", "global_steps": 7}}}
+    scored_sessions, cleared, refills = [], [], []
+    aborted, two_scored, release_last = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def put(*, key, partition_id, tag):
+        metadata[partition_id].setdefault(key, {}).update(tag)
+
+    async def put_batch(*, keys, fields, tags, partition_id):
+        for key, tag in zip(keys, tags, strict=True):
+            metadata[partition_id][key] = tag
+
+    def clear(*, keys, partition_id):
+        cleared.append(set(keys))
+        for key in keys:
+            metadata[partition_id].pop(key, None)
+
+    monkeypatch.setattr(agent_loop_tq_module.tq, "async_kv_put", put)
+    monkeypatch.setattr(agent_loop_tq_module.tq, "async_kv_batch_put", put_batch)
+    monkeypatch.setattr(agent_loop_tq_module.tq, "kv_list", lambda: metadata)
+    monkeypatch.setattr(agent_loop_tq_module.tq, "kv_clear", clear)
+
+    async def generate(self, request_id, **kwargs):
+        if request_id == "0":
+            return TokenOutput(token_ids=token_ids, stop_reason="aborted")
+        if request_id == "3":
+            await release_last.wait()
+        return TokenOutput(token_ids=[11, 12], stop_reason="completed", extra_fields={"global_steps": 7})
+
+    monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
+
+    class Worker(_DummyWorker):
+        def __init__(self):
+            super().__init__(topk_log_probs=0)
+            self.config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"n": 4}}})
+            self.client = FullyAsyncLLMServerClient(
+                config=SimpleNamespace(async_training=SimpleNamespace(partial_rollout=False)),
+            )
+
+        async def _compute_score(self, outputs, kwargs):
+            scored_sessions.append(kwargs["session_id"])
+            for output in outputs:
+                output.reward_score = 1.0
+            if len(scored_sessions) == 2:
+                two_scored.set()
+
+        async def _run_agent_loop(self, sampling_params, *, trajectory, trace, session_id, **prompt):
+            try:
+                output = await self.client.generate(
+                    request_id=str(session_id), prompt_ids=[101], sampling_params=sampling_params
+                )
+                await _WorkerTQ._agent_loop_postprocess(
+                    self, _output({"stop_reason": output.stop_reason}), False, session_id=session_id, **prompt
+                )
+            except RolloutAbortedError:
+                aborted.set()
+                raise
+
+    task = asyncio.create_task(
+        _WorkerTQ._run_prompt(Worker(), {"uid": "u0", "global_steps": 7}, {}, {"validate": False})
+    )
+    try:
+        await asyncio.wait_for(aborted.wait(), timeout=2)
+        await asyncio.wait_for(two_scored.wait(), timeout=2)
+        assert metadata["train"]["u0"]["status"] == "running"
+        assert "u0_0_0" not in metadata["train"]
+        assert not task.done(), "The failed group must remain running while a sibling can still write"
+    finally:
+        release_last.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert metadata["train"]["u0"]["status"] == "failure"
+    assert set(scored_sessions) == {1, 2, 3}
+    assert {key for key in metadata["train"] if key != "u0"} == {"u0_1_0", "u0_2_0", "u0_3_0"}
+
+    def refill(count):
+        refills.append(count)
+        metadata["train"]["replacement"] = {"is_prompt": True, "status": "finished", "global_steps": 8}
+        for session in range(4):
+            metadata["train"][f"replacement_{session}_0"] = {
+                "status": "success",
+                "global_steps": 8,
+                "min_global_steps": 8,
+                "max_global_steps": 8,
+            }
+
+    replay = ReplayBufferAsync(
+        trainer_mode="separate_async",
+        trainer_config={},
+        max_off_policy_threshold=8,
+        max_off_policy_strategy="drop",
+        sampler_kwargs={},
+        refill_fn=refill,
+    )
+    batch, metrics = replay.sample(global_steps=8, partition_id="train", batch_size=1)
+
+    assert refills == [1], "One failed GRPO group must produce exactly one replacement prompt"
+    assert cleared[0] == {"u0", "u0_1_0", "u0_2_0", "u0_3_0"}
+    assert set(batch.keys) == {f"replacement_{session}_0" for session in range(4)}
+    assert metrics["training/rollout_failure/evicted_samples"] == 1
+    assert not any(key.startswith("u0") for key in metadata["train"])

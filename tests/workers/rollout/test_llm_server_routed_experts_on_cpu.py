@@ -32,9 +32,10 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from verl.workers.rollout import llm_server
-from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, RolloutAbortedError
 from verl.workers.rollout.replica import TokenOutput
 
 LAYERS, TOPK = 2, 4
@@ -95,31 +96,64 @@ def _client() -> FullyAsyncLLMServerClient:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("partial_rollout", [True, False])
-async def test_async_client_retries_rejection_and_returns_complete_response(monkeypatch, partial_rollout):
-    segments = [TokenOutput(token_ids=[], stop_reason="aborted", extra_fields={"global_steps": 6})]
-    if partial_rollout:
-        segments.extend(
-            [
-                TokenOutput(token_ids=[101], stop_reason="abort", extra_fields={"global_steps": 7}),
-                TokenOutput(token_ids=[102], stop_reason="completed", extra_fields={"global_steps": 8}),
-            ]
-        )
-    else:
-        # With partial rollout disabled, admitted requests finish before the weight update.
-        segments.append(TokenOutput(token_ids=[101, 102], stop_reason="completed", extra_fields={"global_steps": 7}))
+async def test_async_client_retries_rejection_and_returns_complete_response(monkeypatch):
+    segments = [
+        TokenOutput(token_ids=[], stop_reason="aborted", extra_fields={"global_steps": 6}),
+        TokenOutput(token_ids=[101], stop_reason="abort", extra_fields={"global_steps": 7}),
+        TokenOutput(token_ids=[102], stop_reason="completed", extra_fields={"global_steps": 8}),
+    ]
     prompts_seen = _install_segments(monkeypatch, segments)
     client = FullyAsyncLLMServerClient(
-        config=SimpleNamespace(async_training=SimpleNamespace(partial_rollout=partial_rollout)),
+        config=SimpleNamespace(async_training=SimpleNamespace(partial_rollout=True)),
         load_balancer_handle=None,
     )
 
     output = await client.generate(request_id="req-0", prompt_ids=[1], sampling_params={})
 
-    assert prompts_seen == ([[1], [1], [1, 101]] if partial_rollout else [[1], [1]])
+    assert prompts_seen == [[1], [1], [1, 101]]
     assert output.token_ids == [101, 102] and output.stop_reason == "completed"
     assert output.extra_fields["min_global_steps"] == 7
-    assert output.extra_fields["max_global_steps"] == (8 if partial_rollout else 7)
+    assert output.extra_fields["max_global_steps"] == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["abort", "aborted"])
+@pytest.mark.parametrize("token_ids", [[], [101], [101, 102]])
+@pytest.mark.parametrize("config_kind", ["namespace", "omegaconf"])
+async def test_disabled_partial_rollout_discards_abort_without_retry(monkeypatch, stop_reason, token_ids, config_kind):
+    prompts_seen = _install_segments(monkeypatch, [TokenOutput(token_ids=token_ids, stop_reason=stop_reason)])
+    config = (
+        OmegaConf.create({"async_training": {"partial_rollout": False}})
+        if config_kind == "omegaconf"
+        else SimpleNamespace(async_training=SimpleNamespace(partial_rollout=False))
+    )
+    client = FullyAsyncLLMServerClient(
+        config=config,
+    )
+
+    # A full budget on an aborted result must not bypass dropping by becoming "length".
+    with pytest.raises(RolloutAbortedError, match="partial_rollout disabled"):
+        await client.generate(request_id="r", prompt_ids=[1], sampling_params={"max_tokens": 2})
+
+    assert prompts_seen == [[1]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["completed", "length"])
+async def test_disabled_partial_rollout_keeps_normally_finished_response(monkeypatch, stop_reason):
+    prompts_seen = _install_segments(
+        monkeypatch,
+        [TokenOutput(token_ids=[101], stop_reason=stop_reason, extra_fields={"global_steps": 7})],
+    )
+    client = FullyAsyncLLMServerClient(
+        config=SimpleNamespace(async_training=SimpleNamespace(partial_rollout=False)),
+    )
+
+    output = await client.generate(request_id="r", prompt_ids=[1], sampling_params={})
+
+    assert prompts_seen == [[1]]
+    assert output.token_ids == [101] and output.stop_reason == stop_reason
+    assert output.extra_fields["min_global_steps"] == output.extra_fields["max_global_steps"] == 7
 
 
 @pytest.mark.asyncio

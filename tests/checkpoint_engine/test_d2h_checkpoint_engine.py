@@ -14,7 +14,6 @@
 
 import asyncio
 import concurrent.futures
-from types import SimpleNamespace
 
 import pytest
 import ray
@@ -82,25 +81,8 @@ async def test_manager_waits_for_strong_sync_commit():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("partial_rollout", [True, False])
-async def test_strong_sync_quiesces_rollout_before_build_and_publish(monkeypatch, partial_rollout):
+async def test_strong_sync_quiesces_rollout_before_build_and_publish(monkeypatch):
     calls = []
-    quiescing = asyncio.Event()
-    quiesced = asyncio.Event()
-
-    class FakeReplica:
-        workers = ["worker"]
-        config = SimpleNamespace(external_kv_cache_invalidation="reset")
-
-        async def abort_all_requests(self, reject_request=False):
-            calls.append("abort")
-            quiescing.set()
-            await quiesced.wait()
-
-        async def finish_all_requests(self, reject_request=False):
-            calls.append("finish")
-            quiescing.set()
-            await quiesced.wait()
 
     class FakeRayWorkerGroup:
         def __init__(self, **kwargs):
@@ -117,9 +99,11 @@ async def test_strong_sync_quiesces_rollout_before_build_and_publish(monkeypatch
     manager.backend = "nccl"
     manager.backend_cls = _StrongSyncBackend
     manager.actor_wg = FakeActorWorkerGroup()
-    manager.replicas = [FakeReplica()]
-    manager.partial_rollout = partial_rollout
+    manager.replicas = [type("Replica", (), {"workers": ["worker"]})()]
     manager._background_loop = object()
+
+    async def abort_replicas():
+        calls.append("abort")
 
     async def release_kv_cache_replicas():
         calls.append("release_kv_cache")
@@ -132,24 +116,18 @@ async def test_strong_sync_quiesces_rollout_before_build_and_publish(monkeypatch
         coro.close()
         return concurrent.futures.Future()
 
+    manager.abort_replicas = abort_replicas
     manager.release_kv_cache_replicas = release_kv_cache_replicas
     manager.build_process_group = build_process_group
     monkeypatch.setattr(checkpoint_engine_base, "RayWorkerGroup", FakeRayWorkerGroup)
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_coroutine_threadsafe)
 
-    update = asyncio.create_task(manager.submit_update(global_steps=4))
-    await asyncio.wait_for(quiescing.wait(), timeout=1)
-    pause = "abort" if partial_rollout else "finish"
-    assert calls == ["create_rollout_group", pause]
-    assert not update.done(), "weight transfer must wait for generation to quiesce"
-
-    quiesced.set()
-    ticket = await asyncio.wait_for(update, timeout=1)
+    ticket = await manager.submit_update(global_steps=4)
 
     assert ticket.trainer_published == ["published"]
     assert calls == [
         "create_rollout_group",
-        pause,
+        "abort",
         "release_kv_cache",
         "build_process_group",
         "publish",

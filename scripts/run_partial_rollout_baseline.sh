@@ -66,12 +66,16 @@ BASELINE_CONFIG_NAME=Omega_qwen25_7b_single_instance_4t4r
 case "${1:-}" in
     true|false)
         BASELINE_CONFIG_NAME="${BASELINE_CONFIG_NAME}_partial_rollout_$1"
-        export RUN_ID="omega_qwen25_7b_single_instance_4t4r_partial_rollout_${1}_r01"
+        RUN_VARIANT="$1"
+        if [[ "$1" == false ]]; then
+            RUN_VARIANT=false_drop
+        fi
+        export RUN_ID="${RUN_ID:-omega_qwen25_7b_single_instance_4t4r_partial_rollout_${RUN_VARIANT}_r01}"
         shift
         ;;
     debug_false_repeat|debug_false_trace|debug_false_token_is|debug_true_trace)
         BASELINE_CONFIG_NAME="${BASELINE_CONFIG_NAME}_$1"
-        export RUN_ID="omega_qwen25_7b_single_instance_4t4r_${1}_r01"
+        export RUN_ID="${RUN_ID:-omega_qwen25_7b_single_instance_4t4r_${1}_r01}"
         shift
         ;;
 esac
