@@ -278,7 +278,6 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 original_max_tokens = response_length
                 sampling_params[limit_key] = response_length
 
-        partial_rollout = getattr(getattr(self.config, "async_training", None), "partial_rollout", True)
         final_output = TokenOutput(
             token_ids=[],
             log_probs=[],
@@ -305,9 +304,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 **kwargs,
             )
 
-            # Check before merging tokens or converting an exhausted budget to "length":
-            # even a nonempty abort is not a completed response when continuation is disabled.
-            if output.stop_reason in ("aborted", "abort") and not partial_rollout:
+            should_retry = True
+            if hasattr(self.config, "async_training") and not self.config.async_training.partial_rollout:
+                should_retry = False
+            # Reject aborted responses before merging or applying the length budget.
+            if output.stop_reason in ("aborted", "abort") and not should_retry:
                 raise RolloutAbortedError(f"Rollout request {request_id} was aborted with partial_rollout disabled")
 
             # 2. merge output into final_output
@@ -366,9 +367,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     break
 
             # 4. check stop reason
-            # Partial rollout retains the prefix and retries after weight synchronization.
-            # Disabled continuation raises above so the caller can discard the prompt group.
-            if output.stop_reason not in ("aborted", "abort"):
+            if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 
             await asyncio.sleep(1)

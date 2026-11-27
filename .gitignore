@@ -130,3 +130,9 @@ logs
 log
 outputs
 .history
+
+# Local partial-rollout investigation and experiment records
+/partial_rollout_bug.md
+/partial_rollout_fix_record.md
+/partial_rollout_false_log_analysis.md
+/partial_rollout_drop_record.md

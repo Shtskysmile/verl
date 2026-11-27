@@ -33,7 +33,6 @@ from verl.experimental.agent_loop import (
 )
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
-from verl.workers.rollout.llm_server import RolloutAbortedError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -138,12 +137,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # ReplayBuffer clears a failed group.
             session_errors = await _settle_session_tasks(tasks)
             if session_errors:
-                aborted_sessions = sum(isinstance(error, RolloutAbortedError) for error in session_errors)
-                if aborted_sessions:
-                    logger.info("Dropping prompt group uid=%s after %s aborted sessions", uid, aborted_sessions)
                 for error in session_errors:
-                    if isinstance(error, RolloutAbortedError):
-                        continue
                     logger.error(
                         f"Error in _run_prompt for uid={uid}",
                         exc_info=(type(error), error, error.__traceback__),
@@ -167,9 +161,6 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         if not outputs:
             logger.warning(f"Empty output for prompt {uid}_{session_id}")
             return
-
-        if any(output.extra_fields.get("stop_reason") in ("aborted", "abort") for output in outputs):
-            raise RolloutAbortedError(f"Agent loop {uid}_{session_id} returned an aborted response")
 
         await self._compute_score(outputs, kwargs=kwargs)
 

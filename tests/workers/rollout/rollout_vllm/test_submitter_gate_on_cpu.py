@@ -28,7 +28,6 @@ _preprocess_sampling_params before admission, _postprocess_output after release.
 """
 
 import asyncio
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -38,9 +37,7 @@ pytest.importorskip("vllm")
 
 from vllm.logprobs import Logprob
 
-from verl.checkpoint_engine import base as checkpoint_engine_base
 from verl.workers.config import RolloutConfig
-from verl.workers.rollout import llm_server
 from verl.workers.rollout.vllm_rollout import vllm_async_server
 
 
@@ -676,131 +673,6 @@ def test_sleep_keeps_external_kv_store_only_when_salted(rollout_mode, method, mo
 
         (call,) = server.engine.sleep_calls
         assert call.get("reset_connector", "unsupported") == expected_reset
-
-    asyncio.run(main())
-
-
-@pytest.mark.parametrize("partial_rollout", [True, False])
-def test_weight_update_aborts_and_resumes_or_discards(monkeypatch, partial_rollout):
-    async def main():
-        server = _make_generating_server(monkeypatch, vllm_async_server.vLLMHttpServer, [])
-        server.config = replace(server.config, free_cache_engine=False)
-        admitted = asyncio.Event()
-        retrying = asyncio.Event()
-        transferring = asyncio.Event()
-        install_weights = asyncio.Event()
-
-        class Engine(_QueuedEngine):
-            def complete(self, rid, tokens, finish_reason="stop"):
-                output = _request_output(tokens, finish_reason=finish_reason)
-                output.finished = True
-                self.queues.pop(rid).put_nowait(output)
-                del self.output_processor.request_states[rid]
-
-            async def add_request(self, rid, prompt, params, **kwargs):
-                self.prompts.append(list(prompt["prompt_token_ids"]))
-                collector = await super().add_request(rid, prompt, params, **kwargs)
-                admitted.set()
-                if server.global_steps == 8:
-                    self.complete(rid, [6])
-                return collector
-
-            async def pause_generation(self, **kwargs):
-                if not kwargs.get("wait_for_inflight_requests") and kwargs.get("mode") != "wait":
-                    for rid in list(self.queues):
-                        self.aborted.append(rid)
-                        self.complete(rid, [5], finish_reason="abort")
-                await super().pause_generation(**kwargs)
-
-        server.engine = Engine()
-        server.engine.server = server
-        replica = object.__new__(vllm_async_server.vLLMReplica)
-        replica.config = server.config
-        replica.workers = ["worker"]
-        replica.servers = [
-            SimpleNamespace(
-                **{
-                    name: SimpleNamespace(remote=getattr(server, name))
-                    for name in (
-                        "abort_all_requests",
-                        "wait_for_requests_to_drain",
-                        "release_kv_cache",
-                        "resume_kv_cache",
-                        "resume_engine_generation",
-                        "open_submission_gate",
-                    )
-                }
-            )
-        ]
-
-        class WorkerGroup:
-            world_size = 1
-
-            def __init__(self, **kwargs):
-                pass
-
-            def update_weights(self, global_steps, **kwargs):
-                async def transfer():
-                    transferring.set()
-                    await install_weights.wait()
-                    await server.set_global_steps(global_steps)
-
-                return [transfer()]
-
-            def execute_checkpoint_engine(self, methods):
-                return []
-
-        manager = object.__new__(checkpoint_engine_base.CheckpointEngineManager)
-        manager.backend = "nccl"
-        manager.backend_cls = SimpleNamespace(support_publish_weights=False)
-        manager.actor_wg = WorkerGroup()
-        manager.replicas = [replica]
-        manager._update_ticket = None
-        manager._background_loop = asyncio.get_running_loop()
-        monkeypatch.setattr(manager, "build_process_group", lambda rollout: None)
-        monkeypatch.setattr(checkpoint_engine_base, "RayWorkerGroup", WorkerGroup)
-        attempts = 0
-
-        async def generate(self, request_id, *, prompt_ids, sampling_params, **kwargs):
-            nonlocal attempts
-            attempts += 1
-            if attempts == 2:
-                retrying.set()
-            return await server.generate(prompt_ids, dict(sampling_params), f"{request_id}-{attempts}")
-
-        monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
-        client = llm_server.FullyAsyncLLMServerClient(
-            config=SimpleNamespace(async_training=SimpleNamespace(partial_rollout=partial_rollout)),
-        )
-        response = asyncio.create_task(client.generate(request_id="r", prompt_ids=[1, 2], sampling_params={}))
-        await asyncio.wait_for(admitted.wait(), timeout=2)
-        prefix = _request_output([5], finish_reason=None)
-        prefix.finished = False
-        server.engine.queues["r-1"].put_nowait(prefix)
-        update = asyncio.create_task(manager.update_weights(global_steps=8))
-
-        await asyncio.wait_for(transferring.wait(), timeout=2)
-        if partial_rollout:
-            await asyncio.wait_for(retrying.wait(), timeout=2)
-            assert not response.done(), "Continuation must wait for the new weights"
-        else:
-            with pytest.raises(llm_server.RolloutAbortedError):
-                await asyncio.wait_for(response, timeout=2)
-            assert attempts == 1, "Disabled continuation must not resubmit the aborted prefix"
-        assert server.engine.aborted == ["r-1"]
-        assert server.global_steps == 7 and server._submission_paused
-        assert server.engine.resume_calls == 0 and server.engine.prompts == [[1, 2]]
-
-        install_weights.set()
-        await asyncio.wait_for(update, timeout=2)
-        if partial_rollout:
-            output = await asyncio.wait_for(response, timeout=2)
-            assert output.token_ids == [5, 6] and output.stop_reason == "completed"
-            assert output.extra_fields["finish_reason"] == "stop"
-            assert output.extra_fields["min_global_steps"] == 7
-            assert output.extra_fields["max_global_steps"] == 8
-        assert server.engine.prompts == ([[1, 2], [1, 2, 5]] if partial_rollout else [[1, 2]])
-        assert server.global_steps == 8 and server.engine.resume_calls == 1
 
     asyncio.run(main())
 

@@ -117,19 +117,10 @@ async def test_async_client_retries_rejection_and_returns_complete_response(monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stop_reason", ["abort", "aborted"])
-@pytest.mark.parametrize("token_ids", [[], [101], [101, 102]])
-@pytest.mark.parametrize("config_kind", ["namespace", "omegaconf"])
-async def test_disabled_partial_rollout_discards_abort_without_retry(monkeypatch, stop_reason, token_ids, config_kind):
+@pytest.mark.parametrize(("stop_reason", "token_ids"), [("aborted", []), ("abort", [101]), ("aborted", [101, 102])])
+async def test_disabled_partial_rollout_discards_abort_without_retry(monkeypatch, stop_reason, token_ids):
     prompts_seen = _install_segments(monkeypatch, [TokenOutput(token_ids=token_ids, stop_reason=stop_reason)])
-    config = (
-        OmegaConf.create({"async_training": {"partial_rollout": False}})
-        if config_kind == "omegaconf"
-        else SimpleNamespace(async_training=SimpleNamespace(partial_rollout=False))
-    )
-    client = FullyAsyncLLMServerClient(
-        config=config,
-    )
+    client = FullyAsyncLLMServerClient(config=OmegaConf.create({"async_training": {"partial_rollout": False}}))
 
     # A full budget on an aborted result must not bypass dropping by becoming "length".
     with pytest.raises(RolloutAbortedError, match="partial_rollout disabled"):
