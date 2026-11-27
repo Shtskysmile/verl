@@ -1,0 +1,143 @@
+# Retain the original Omega reproduction data and training/rollout hyperparameters.
+# Qwen2.5-7B-Instruct, one instance with disjoint trainer 4-NPU and rollout 4-NPU pools.
+# Trace false behavior with validation and checkpoints at every training step.
+# Preserve the original data, model, sampling parameters, and optimizer hyperparameters.
+# Launch with scripts/run_partial_rollout_baseline.sh to activate the reference CANN/ATB stack.
+# Driver and Ray workers both use /root/.local/conda/envs/verl/bin/python.
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  actor:
+    strategy: fsdp2
+    fsdp_config:
+      param_offload: true
+      forward_prefetch: false
+      use_torch_compile: false
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: bf16
+        buffer_dtype: fp32
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 8
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 2048
+    use_kl_loss: true
+    ulysses_sequence_parallel_size: 4
+  ref:
+    strategy: fsdp2
+    log_prob_micro_batch_size_per_gpu: 8
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 2048
+    fsdp_config:
+      param_offload: true
+      use_torch_compile: false
+  rollout:
+    name: vllm
+    nnodes: 1
+    n_gpus_per_node: 4
+    gpu_memory_utilization: 0.7
+    enforce_eager: true
+    free_cache_engine: false
+    tensor_model_parallel_size: 4
+    max_num_batched_tokens: 4096
+    max_num_seqs: 128
+    load_format: safetensors
+    'n': 4
+    engine_kwargs:
+      vllm:
+        additional_config:
+          rl_config:
+            enabled: true
+          weight_nz_mode: 0
+          ascend_compilation_config:
+            fuse_qknorm_rope: false
+        worker_cls: auto
+    checkpoint_engine:
+      backend: nccl
+      custom_backend_module: null
+    enable_sleep_mode: false
+  model:
+    path: /root/work/models/Qwen2.5-7B-Instruct
+  hybrid_engine: false
+data:
+  train_files: /root/work/tiankuan/dataset/verl/gsm8k/train.parquet
+  val_files: /root/work/tiankuan/dataset/verl/gsm8k/test.parquet
+  max_prompt_length: 2048
+  max_response_length: 2048
+  # V1 requires train_batch_size = ppo_mini_batch_size * parameter_sync_step.
+  train_batch_size: 64
+  val_max_samples: -1
+  gen_batch_size: 16
+  shuffle: false
+  filter_overlong_prompts: true
+  custom_dataloader: null
+reward:
+  preset: null
+algorithm:
+  adv_estimator: grpo
+async_training:
+  # Keep this explicit to select the asynchronous weight-update policy.
+  partial_rollout: false
+trainer:
+  total_epochs: 1
+  total_training_steps: 10
+  test_freq: 1
+  save_freq: 1
+  rollout_data_dir: ${trainer.default_local_dir}/../rollout
+  validation_data_dir: ${trainer.default_local_dir}/../validation
+  v1:
+    trainer_mode: separate_async
+    separate_async:
+      num_warmup_batches: 1
+      parameter_sync_step: 1
+      hybrid_rollout:
+        enable_switch: false
+    sampler:
+      max_off_policy_threshold: 8
+      max_off_policy_strategy: drop
+  project_name: partial_rollout_repro
+  experiment_name: ${oc.env:RUN_ID,omega_qwen25_7b_single_instance_4t4r}
+  logger:
+  - console
+  - file
+  nnodes: 1
+  n_gpus_per_node: 4
+  resume_mode: disable
+  val_before_train: true
+  default_local_dir: outputs/${trainer.project_name}/${trainer.experiment_name}/ckpts
+  device: npu
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      py_executable: /root/.local/conda/envs/verl/bin/python
+      env_vars:
+        ASCEND_GLOBAL_LOG_LEVEL: '1'
+        DENSE_ASCEND_LOG_LEVEL: '1'
+        VERL_PLATFORM: huawei
+        VERL_LOGGING_LEVEL: INFO
+        RAY_DEDUP_LOGS: '0'
+        RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES: '1'
+        VLLM_ASCEND_ENABLE_NZ: '0'
+        HCCL_SOCKET_IFNAME: eth0
+        GLOO_SOCKET_IFNAME: eth0
+        TP_SOCKET_IFNAME: eth0
+        HCCL_CONNECT_TIMEOUT: '3600'
+        HCCL_EXEC_TIMEOUT: '7200'
+        NO_PROXY: '*'
+        no_proxy: '*'
+    address: local
+    namespace: ${trainer.experiment_name}
+    resources:
+      NPU: 8
+transfer_queue:
+  enable: true
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+  run:
+    dir: ${trainer.default_local_dir}/../hydra
+  job:
+    chdir: false

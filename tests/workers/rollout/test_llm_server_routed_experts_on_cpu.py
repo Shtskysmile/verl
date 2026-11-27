@@ -90,9 +90,36 @@ def _install_segments(monkeypatch: pytest.MonkeyPatch, segments: list[TokenOutpu
 
 
 def _client() -> FullyAsyncLLMServerClient:
-    # A config without ``async_training`` leaves partial rollout enabled, so the client
-    # retries on "aborted" instead of returning after the first attempt.
+    # Lightweight config: rollout interruption is handled by the async client.
     return FullyAsyncLLMServerClient(config=SimpleNamespace(), load_balancer_handle=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_rollout", [True, False])
+async def test_async_client_retries_rejection_and_returns_complete_response(monkeypatch, partial_rollout):
+    segments = [TokenOutput(token_ids=[], stop_reason="aborted", extra_fields={"global_steps": 6})]
+    if partial_rollout:
+        segments.extend(
+            [
+                TokenOutput(token_ids=[101], stop_reason="abort", extra_fields={"global_steps": 7}),
+                TokenOutput(token_ids=[102], stop_reason="completed", extra_fields={"global_steps": 8}),
+            ]
+        )
+    else:
+        # With partial rollout disabled, admitted requests finish before the weight update.
+        segments.append(TokenOutput(token_ids=[101, 102], stop_reason="completed", extra_fields={"global_steps": 7}))
+    prompts_seen = _install_segments(monkeypatch, segments)
+    client = FullyAsyncLLMServerClient(
+        config=SimpleNamespace(async_training=SimpleNamespace(partial_rollout=partial_rollout)),
+        load_balancer_handle=None,
+    )
+
+    output = await client.generate(request_id="req-0", prompt_ids=[1], sampling_params={})
+
+    assert prompts_seen == ([[1], [1], [1, 101]] if partial_rollout else [[1], [1]])
+    assert output.token_ids == [101, 102] and output.stop_reason == "completed"
+    assert output.extra_fields["min_global_steps"] == 7
+    assert output.extra_fields["max_global_steps"] == (8 if partial_rollout else 7)
 
 
 @pytest.mark.asyncio

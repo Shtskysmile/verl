@@ -181,6 +181,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
             replicas=self.standalone_server_manager.get_replicas(),
+            partial_rollout=self.config.get("async_training", {}).get("partial_rollout", True),
         )
 
         # hybrid engine is in rollout mode after initialization
@@ -275,7 +276,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self._timed_switch_to_trainer()
 
     def _timed_switch_to_trainer(self) -> None:
-        """Switch Hybrid back to training and record the full remove/abort/sleep cost."""
+        """Switch Hybrid back to training and record the full remove/pause/sleep cost."""
         switch_start = time.perf_counter()
         with marked_timer("switch_to_trainer", self.timing_raw, color="cyan"):
             self.switch_to_trainer()
@@ -433,7 +434,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         self.current_mode = HybridEngineMode.ROLLOUT
 
     def switch_to_trainer(self):
-        """Stop routing to Hybrid, abort partial requests, and return its GPU memory to training."""
+        """Stop routing to Hybrid, pause generation, and return its GPU memory to training."""
         if not self._enable_hybrid_replicas:
             return
         self.remove_replicas_from_balancer()

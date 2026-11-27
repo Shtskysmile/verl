@@ -406,6 +406,8 @@ class PPOTrainer(ABC):
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
+            partial_rollout=self.trainer_mode == "sync"
+            or self.config.get("async_training", {}).get("partial_rollout", True),
         )
         logger.info("checkpoint engine manager initialized")
 

@@ -137,8 +137,7 @@ async def test_resumes_never_exceed_response_length(server, prompt_len):
 
 @pytest.mark.asyncio
 async def test_cap_holds_without_async_training_key(server):
-    """v1 async trainers install this client with a config that has no ``async_training`` key, so
-    ``should_retry`` stays True and the resume loop runs with no way to opt out."""
+    """The async client's resume budget also applies without an ``async_training`` key."""
     output = await _generate(_config(include_async_training=False), 136, {"temperature": 1.0})
 
     assert len(output.token_ids) <= RESPONSE_LENGTH

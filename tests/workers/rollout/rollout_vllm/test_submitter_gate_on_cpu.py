@@ -28,6 +28,7 @@ _preprocess_sampling_params before admission, _postprocess_output after release.
 """
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -37,7 +38,9 @@ pytest.importorskip("vllm")
 
 from vllm.logprobs import Logprob
 
+from verl.checkpoint_engine import base as checkpoint_engine_base
 from verl.workers.config import RolloutConfig
+from verl.workers.rollout import llm_server
 from verl.workers.rollout.vllm_rollout import vllm_async_server
 
 
@@ -124,20 +127,22 @@ def _make_server(node_rank: int = 0, cls=vllm_async_server.vLLMHttpServer):
     return server
 
 
-def test_abort_does_not_pause_until_inflight_admissions_land():
+@pytest.mark.parametrize("partial_rollout", [True, False])
+def test_pause_waits_until_inflight_admissions_land(partial_rollout):
     async def main():
         server = _make_server()
         server._admitting = 1  # a turn is past the gate but not yet in the engine
 
-        abort = asyncio.create_task(server.abort_all_requests())
+        pause_requests = server.abort_all_requests if partial_rollout else server.finish_all_requests
+        pause = asyncio.create_task(pause_requests())
         await asyncio.sleep(0.05)
 
         assert server._submission_paused is True, "gate must close before the barrier runs"
-        assert not abort.done(), "abort must not proceed while an admission is in flight"
+        assert not pause.done(), "pause must not proceed while an admission is in flight"
         assert server.engine.pause_calls == 0, "engine paused while an admission was in flight"
 
         server._admitting = 0  # the in-flight admission reaches the engine
-        await asyncio.wait_for(abort, timeout=5)
+        await asyncio.wait_for(pause, timeout=5)
 
         assert server.engine.pause_calls == 1
         assert server.engine.admitting_at_pause == 0
@@ -385,7 +390,7 @@ def test_default_request_hooks_leave_generate_output_unchanged(monkeypatch, fini
 
         assert server.engine.sampling_params[0].logprob_token_ids is None
         assert output.token_ids == [5, 9] and output.stop_reason == stop_reason
-        assert output.extra_fields == {"global_steps": 7, "num_cached_tokens": 0}
+        assert output.extra_fields == {"global_steps": 7, "num_cached_tokens": 0, "finish_reason": finish_reason}
         assert server.engine.closed == 1
         assert server._admitting == 0
 
@@ -433,6 +438,9 @@ class _QueuedEngine(_FakeEngine):
 
     async def pause_generation(self, **kwargs):
         await super().pause_generation(**kwargs)
+        if kwargs.get("mode") == "wait" or kwargs.get("wait_for_inflight_requests"):
+            assert not self.output_processor.request_states
+            return
         # abort mode: every in-flight request finishes with an empty output.
         for rid, q in self.queues.items():
             self.aborted.append(rid)
@@ -484,6 +492,202 @@ def test_abort_is_not_blocked_by_requests_waiting_for_their_first_token():
         # Requests that finish normally close their collectors and are not aborted again.
         assert server.engine.closed == 8 and server.engine.engine_aborts == []
         assert server._admitting == 0
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("vllm_version", ["0.29.0", "0.32.0"])
+def test_finish_completes_queued_and_preempted_requests_before_weight_update(monkeypatch, vllm_version):
+    async def main():
+        server = _make_generating_server(monkeypatch, vllm_async_server.vLLMHttpServer, [])
+        server.engine = _QueuedEngine()
+        server.engine.server = server
+        monkeypatch.setattr(vllm_async_server, "_VLLM_VERSION", vllm_async_server.version.parse(vllm_version))
+        read_output = asyncio.Event()
+        generate_admitted = server._generate_admitted
+
+        async def delayed_output(**kwargs):
+            result = await generate_admitted(**kwargs)
+            await read_output.wait()
+            return result
+
+        monkeypatch.setattr(server, "_generate_admitted", delayed_output)
+        old = [asyncio.create_task(server.generate([1], {}, rid)) for rid in ("queued", "preempted")]
+        await asyncio.sleep(0.05)
+        prefix = _request_output([5], finish_reason=None)
+        prefix.finished = False
+        server.engine.queues["preempted"].put_nowait(prefix)
+
+        async def update_weights():
+            result = await server.finish_all_requests()
+            await server.set_global_steps(8)
+            return result
+
+        update = asyncio.create_task(update_weights())
+        await asyncio.sleep(0.05)
+        late = asyncio.create_task(server.generate([1], {}, "late"))
+        await asyncio.sleep(0.05)
+        assert server._submission_paused and server._admitting == 0
+        assert not update.done() and server.global_steps == 7
+        assert not late.done() and "late" not in server.engine.queues
+        assert server.engine.pause_calls == 0, "queued requests must keep being scheduled"
+
+        def complete(rid, tokens):
+            output = _request_output(tokens)
+            output.finished = True
+            server.engine.queues.pop(rid).put_nowait(output)
+            del server.engine.output_processor.request_states[rid]
+
+        complete("queued", [9])
+        await asyncio.sleep(0.05)
+        assert not update.done(), "a preempted request must finish on the old weights too"
+        complete("preempted", [5, 6])
+        result = await asyncio.wait_for(update, timeout=1)
+        assert result == {"finished_count": 2, "request_ids": ["queued", "preempted"]}
+        assert server.engine.pause_kwargs == [
+            {"mode": "wait", "clear_cache": True}
+            if vllm_version == "0.32.0"
+            else {"wait_for_inflight_requests": True, "clear_cache": True}
+        ]
+        assert server.engine.aborted == [] and server.engine.engine_aborts == []
+        assert not late.done(), "admission must remain closed through the weight update"
+
+        read_output.set()  # Consume old results only after the new weights are installed.
+        outputs = await asyncio.wait_for(asyncio.gather(*old), timeout=1)
+        assert [output.token_ids for output in outputs] == [[9], [5, 6]]
+        assert all(output.stop_reason == "completed" and output.extra_fields["global_steps"] == 7 for output in outputs)
+        await server.resume_generation()
+        await asyncio.sleep(0.05)
+        complete("late", [10])
+        assert (await asyncio.wait_for(late, timeout=1)).extra_fields["global_steps"] == 8
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("partial_rollout", [True, False])
+def test_weight_update_orders_async_client_completion_and_resume(monkeypatch, partial_rollout):
+    async def main():
+        server = _make_generating_server(monkeypatch, vllm_async_server.vLLMHttpServer, [])
+        server.config = replace(server.config, free_cache_engine=False)
+        admitted = asyncio.Event()
+        retrying = asyncio.Event()
+        transferring = asyncio.Event()
+        install_weights = asyncio.Event()
+
+        class Engine(_QueuedEngine):
+            def complete(self, rid, tokens, finish_reason="stop"):
+                output = _request_output(tokens, finish_reason=finish_reason)
+                output.finished = True
+                self.queues.pop(rid).put_nowait(output)
+                del self.output_processor.request_states[rid]
+
+            async def add_request(self, rid, prompt, params, **kwargs):
+                self.prompts.append(list(prompt["prompt_token_ids"]))
+                collector = await super().add_request(rid, prompt, params, **kwargs)
+                admitted.set()
+                if server.global_steps == 8:
+                    self.complete(rid, [6])
+                return collector
+
+            async def pause_generation(self, **kwargs):
+                if not kwargs.get("wait_for_inflight_requests") and kwargs.get("mode") != "wait":
+                    for rid in list(self.queues):
+                        self.aborted.append(rid)
+                        self.complete(rid, [5], finish_reason="abort")
+                await super().pause_generation(**kwargs)
+
+        server.engine = Engine()
+        server.engine.server = server
+        replica = object.__new__(vllm_async_server.vLLMReplica)
+        replica.config = server.config
+        replica.workers = ["worker"]
+        replica.servers = [
+            SimpleNamespace(
+                **{
+                    name: SimpleNamespace(remote=getattr(server, name))
+                    for name in (
+                        "abort_all_requests",
+                        "finish_all_requests",
+                        "wait_for_requests_to_drain",
+                        "release_kv_cache",
+                        "resume_kv_cache",
+                        "resume_engine_generation",
+                        "open_submission_gate",
+                    )
+                }
+            )
+        ]
+
+        class WorkerGroup:
+            world_size = 1
+
+            def __init__(self, **kwargs):
+                pass
+
+            def update_weights(self, global_steps, **kwargs):
+                async def transfer():
+                    transferring.set()
+                    await install_weights.wait()
+                    await server.set_global_steps(global_steps)
+
+                return [transfer()]
+
+            def execute_checkpoint_engine(self, methods):
+                return []
+
+        manager = object.__new__(checkpoint_engine_base.CheckpointEngineManager)
+        manager.backend = "nccl"
+        manager.backend_cls = SimpleNamespace(support_publish_weights=False)
+        manager.actor_wg = WorkerGroup()
+        manager.replicas = [replica]
+        manager.partial_rollout = partial_rollout
+        manager._update_ticket = None
+        manager._background_loop = asyncio.get_running_loop()
+        monkeypatch.setattr(manager, "build_process_group", lambda rollout: None)
+        monkeypatch.setattr(checkpoint_engine_base, "RayWorkerGroup", WorkerGroup)
+        attempts = 0
+
+        async def generate(self, request_id, *, prompt_ids, sampling_params, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                retrying.set()
+            return await server.generate(prompt_ids, dict(sampling_params), f"{request_id}-{attempts}")
+
+        monkeypatch.setattr(llm_server.LLMServerClient, "generate", generate)
+        client = llm_server.FullyAsyncLLMServerClient(
+            config=SimpleNamespace(async_training=SimpleNamespace(partial_rollout=partial_rollout)),
+        )
+        response = asyncio.create_task(client.generate(request_id="r", prompt_ids=[1, 2], sampling_params={}))
+        await asyncio.wait_for(admitted.wait(), timeout=2)
+        prefix = _request_output([5], finish_reason=None)
+        prefix.finished = False
+        server.engine.queues["r-1"].put_nowait(prefix)
+        update = asyncio.create_task(manager.update_weights(global_steps=8))
+
+        if not partial_rollout:
+            await asyncio.sleep(0.05)
+            assert not transferring.is_set(), "old generation must finish before weight transfer"
+            server.engine.complete("r-1", [5, 6])
+
+        await asyncio.wait_for(transferring.wait(), timeout=2)
+        if partial_rollout:
+            await asyncio.wait_for(retrying.wait(), timeout=2)
+            assert not response.done(), "prefix continuation must wait for the new weights"
+        else:
+            assert (await asyncio.wait_for(response, timeout=2)).extra_fields["global_steps"] == 7
+        assert server.global_steps == 7 and server._submission_paused
+        assert server.engine.resume_calls == 0 and server.engine.prompts == [[1, 2]]
+
+        install_weights.set()
+        await asyncio.wait_for(update, timeout=2)
+        output = await asyncio.wait_for(response, timeout=2)
+        assert output.token_ids == [5, 6] and output.stop_reason == "completed"
+        assert output.extra_fields["finish_reason"] == "stop"
+        assert server.engine.prompts == ([[1, 2], [1, 2, 5]] if partial_rollout else [[1, 2]])
+        assert output.extra_fields["min_global_steps"] == 7
+        assert output.extra_fields["max_global_steps"] == (8 if partial_rollout else 7)
+        assert server.global_steps == 8 and server.engine.resume_calls == 1
 
     asyncio.run(main())
 

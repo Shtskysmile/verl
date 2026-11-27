@@ -342,9 +342,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
-            if min_global_steps is None:
-                min_global_steps = global_steps
-            max_global_steps = global_steps
+            # Empty rejections did not generate tokens on this version.
+            if output.token_ids:
+                if min_global_steps is None:
+                    min_global_steps = global_steps
+                max_global_steps = global_steps
 
             # 3. update max_new_tokens
             if original_max_tokens is not None:
@@ -354,12 +356,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     break
 
             # 4. check stop reason
-            # If partial rollout not enable, aborted samples will be dropped.
-            # For v1 trainer, should_retry is always True. Since self.config.async_training is not exist.
-            should_retry = True
-            if hasattr(self.config, "async_training") and not self.config.async_training.partial_rollout:
-                should_retry = False
-            if output.stop_reason not in ("aborted", "abort") or not should_retry:
+            # Weight updates abort requests only when partial rollout is enabled;
+            # otherwise the server finishes them on the current weights first.
+            # Retry aborted requests instead of returning an unfinished response.
+            if output.stop_reason not in ("aborted", "abort"):
                 break
 
             await asyncio.sleep(1)
