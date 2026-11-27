@@ -40,6 +40,10 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+class RolloutAbortedError(RuntimeError):
+    """An unfinished rollout must be discarded instead of scored or trained."""
+
+
 class LLMServerClient:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -300,6 +304,13 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 **kwargs,
             )
 
+            should_retry = True
+            if hasattr(self.config, "async_training") and not self.config.async_training.partial_rollout:
+                should_retry = False
+            # Reject aborted responses before merging or applying the length budget.
+            if output.stop_reason in ("aborted", "abort") and not should_retry:
+                raise RolloutAbortedError(f"Rollout request {request_id} was aborted with partial_rollout disabled")
+
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
@@ -333,6 +344,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     previous = np.zeros(len(final_output.token_ids) - len(output.token_ids), dtype=np.bool_)
                 final_output.extra_fields["response_support_complete"] = np.concatenate([previous, current])
             final_output.stop_reason = output.stop_reason
+            # Preserve the backend's ending metadata when rebuilding async outputs.
+            final_output.extra_fields["finish_reason"] = output.extra_fields.get("finish_reason")
 
             # carry the initial prefill's prefix-cache hit count forward
             if num_cached_tokens is None:
@@ -340,9 +353,11 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
-            if min_global_steps is None:
-                min_global_steps = global_steps
-            max_global_steps = global_steps
+            # Empty rejections did not generate tokens on this version.
+            if output.token_ids:
+                if min_global_steps is None:
+                    min_global_steps = global_steps
+                max_global_steps = global_steps
 
             # 3. update max_new_tokens
             if original_max_tokens is not None:
@@ -352,11 +367,6 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                     break
 
             # 4. check stop reason
-            # If partial rollout not enable, aborted samples will be dropped.
-            # For v1 trainer, should_retry is always True. Since self.config.async_training is not exist.
-            should_retry = True
-            if hasattr(self.config, "async_training") and not self.config.async_training.partial_rollout:
-                should_retry = False
             if output.stop_reason not in ("aborted", "abort") or not should_retry:
                 break
 

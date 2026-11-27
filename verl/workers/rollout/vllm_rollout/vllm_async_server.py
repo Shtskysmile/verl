@@ -759,6 +759,7 @@ class vLLMHttpServer:
         if rejected is not None:
             return rejected
 
+        global_steps = self.global_steps
         cache_salt = prefix_cache_salt(self.config, self.global_steps)
         if cache_salt is not None:
             prompt["cache_salt"] = cache_salt
@@ -777,11 +778,12 @@ class vLLMHttpServer:
             )
             assert final_res is not None
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
         # outputs may be empty. Return empty results with stop_reason="aborted"
         # instead of crashing with "IndexError: list index out of range".
         if not final_res.outputs:
+            extra_fields["finish_reason"] = "abort"
             aborted = TokenOutput(
                 token_ids=[],
                 log_probs=None,
@@ -843,6 +845,7 @@ class vLLMHttpServer:
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
+        extra_fields["finish_reason"] = finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason == "stop":
