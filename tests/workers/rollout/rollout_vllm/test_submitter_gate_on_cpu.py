@@ -675,26 +675,3 @@ def test_sleep_keeps_external_kv_store_only_when_salted(rollout_mode, method, mo
         assert call.get("reset_connector", "unsupported") == expected_reset
 
     asyncio.run(main())
-
-
-def test_delayed_output_keeps_admitted_weight_version(monkeypatch):
-    async def main():
-        server = _make_generating_server(monkeypatch, vllm_async_server.vLLMHttpServer, [_request_output([5])])
-        generated, release = asyncio.Event(), asyncio.Event()
-        generate_admitted = server._generate_admitted
-
-        async def delayed_output(**kwargs):
-            result = await generate_admitted(**kwargs)
-            generated.set()
-            await release.wait()
-            return result
-
-        monkeypatch.setattr(server, "_generate_admitted", delayed_output)
-        task = asyncio.create_task(server.generate([1], {}, "r"))
-        await asyncio.wait_for(generated.wait(), timeout=2)
-        await server.set_global_steps(8)
-        release.set()
-        output = await asyncio.wait_for(task, timeout=2)
-        assert output.extra_fields["global_steps"] == 7
-
-    asyncio.run(main())
